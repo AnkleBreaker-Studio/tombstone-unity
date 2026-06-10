@@ -1,0 +1,47 @@
+using UnityEngine;
+
+namespace AnkleBreaker.Tombstone
+{
+    /// <summary>
+    /// Tombstone SDK configuration asset. Create one via
+    /// <c>Assets ▸ Create ▸ Tombstone ▸ Config</c>, name it <c>TombstoneConfig</c>, and place it
+    /// under any <c>Resources/</c> folder for zero-code auto-init. Alternatively call
+    /// <see cref="Tombstone.Init(string,string,float)"/> manually and ignore this asset.
+    /// </summary>
+    [CreateAssetMenu(fileName = "TombstoneConfig", menuName = "Tombstone/Config", order = 0)]
+    public sealed class TombstoneConfigSO : ScriptableObject
+    {
+        [Tooltip("Tombstone base URL, e.g. https://your-tenant.example.com")]
+        [SerializeField] private string _endpoint = "https://your-tenant.example.com";
+
+        [Tooltip("Per-game SDK token (tmb_...). Treat as a secret in shipped builds.")]
+        [SerializeField] private string _gameToken = "tmb_REPLACE_ME";
+
+        [Tooltip("Initialize automatically on game load (before the first scene).")]
+        [SerializeField] private bool _autoInitOnLoad = true;
+
+        [Tooltip("Require explicit consent (Tombstone.SetConsent(true)) before any capture/upload.")]
+        [SerializeField] private bool _requireConsent = false;
+
+        [Tooltip("Seconds between session heartbeats (used for CCU billing + crash rate).")]
+        [SerializeField] private float _heartbeatIntervalSeconds = 60f;
+
+        [Tooltip("Automatically capture unhandled exceptions (Unity log, unobserved Tasks, AppDomain) as crash reports.")]
+        [SerializeField] private bool _autoCaptureExceptions = true;
+
+        [Tooltip("Keep a rolling session log (~512 KB) and upload it with crash and bug reports.")]
+        [SerializeField] private bool _uploadLogs = true;
+
+        [Tooltip("On launch, detect a previous session that ended without a clean shutdown (hard crash, OOM kill, force quit) and report it with the preserved log.")]
+        [SerializeField] private bool _detectUncleanShutdown = true;
+
+        public string Endpoint => _endpoint;
+        public string GameToken => _gameToken;
+        public bool AutoInitOnLoad => _autoInitOnLoad;
+        public bool RequireConsent => _requireConsent;
+        public float HeartbeatIntervalSeconds => _heartbeatIntervalSeconds;
+        public bool AutoCaptureExceptions => _autoCaptureExceptions;
+        public bool UploadLogs => _uploadLogs;
+        public bool DetectUncleanShutdown => _detectUncleanShutdown;
+    }
+}
