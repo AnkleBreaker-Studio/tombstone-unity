@@ -54,14 +54,14 @@ namespace AnkleBreaker.Tombstone
         }
 
         /// <summary>Append a numeric JSON field (unquoted, invariant-culture). Used by TrackMetric —
-        /// invariant culture so a comma-decimal locale can't corrupt the JSON, and round-trip ("R")
-        /// formatting so the sample's full double precision survives.</summary>
+        /// invariant culture so a comma-decimal locale can't corrupt the JSON, and "G17" formatting so
+        /// the sample's full double precision survives (Microsoft's recommended round-trip specifier).</summary>
         internal static void AppendNumberField(StringBuilder sb, string key, double value, ref bool first)
         {
             if (!first) sb.Append(',');
             first = false;
             sb.Append('"').Append(key).Append("\":")
-              .Append(value.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+              .Append(value.ToString("G17", System.Globalization.CultureInfo.InvariantCulture));
         }
 
         /// <summary>

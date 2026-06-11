@@ -184,20 +184,32 @@ namespace AnkleBreaker.Tombstone
         public string targetType;
         /// <summary>The userId / sessionId / matchId / serverId this request targets.</summary>
         public string targetValue;
+        /// <summary>Single-use fulfilment nonce minted server-side for this request; echoed back in the
+        /// fulfil body so the server can authenticate the honouring client. Absent on older servers
+        /// (JsonUtility leaves it "" → echoed as ""). </summary>
+        public string fulfillNonce;
+        /// <summary>Unix-epoch expiry of <see cref="fulfillNonce"/>; echoed back so the server can
+        /// reject a stale nonce. Absent on older servers (JsonUtility leaves it 0).</summary>
+        public long nonceExpiry;
     }
 
     /// <summary>Body the client POSTs to fulfil a pull (<c>/pull-requests/{id}/fulfill</c>) — its
-    /// asserted correlation identity, so the server can confirm the client is genuinely targeted.</summary>
+    /// asserted correlation identity plus the fulfilment nonce, so the server can confirm the client
+    /// is genuinely targeted and the fulfilment is authentic + fresh.</summary>
     [Serializable]
     internal sealed class PullFulfillPayload
     {
         /// <summary>Player id set via <see cref="Tombstone.SetUser"/> ("" when anonymous).</summary>
         public string userId;
-        /// <summary>This launch's session id.</summary>
+        /// <summary>This launch's session id (the one the client heartbeated with).</summary>
         public string sessionId;
         /// <summary>Correlation: current match id (null when unset → omitted-equivalent server-side).</summary>
         public string matchId;
         /// <summary>Correlation: current server id (null when unset).</summary>
         public string serverId;
+        /// <summary>The <see cref="PullRequestDto.fulfillNonce"/> from the ack, presented back verbatim.</summary>
+        public string nonce;
+        /// <summary>The <see cref="PullRequestDto.nonceExpiry"/> from the ack, presented back verbatim.</summary>
+        public long nonceExpiry;
     }
 }

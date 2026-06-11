@@ -19,6 +19,45 @@ namespace AnkleBreaker.Tombstone
     }
 
     /// <summary>
+    /// Immutable snapshot of SDK state returned by <see cref="Tombstone.GetDiagnostics"/> (§K3) — for
+    /// support overlays / dev HUDs. A value type: reading it allocates nothing beyond the struct itself.
+    /// </summary>
+    public readonly struct TombstoneDiagnostics
+    {
+        /// <summary>True once <see cref="Tombstone.Init"/> has completed.</summary>
+        public readonly bool Initialized;
+        /// <summary>Current telemetry consent state.</summary>
+        public readonly bool ConsentGranted;
+        /// <summary>Payloads waiting in the in-memory outbound queue.</summary>
+        public readonly int QueuedOutbound;
+        /// <summary>Write-ahead payloads persisted to the offline sidecar directory.</summary>
+        public readonly int PersistedSidecar;
+        /// <summary>Seconds since the last event/metric batch flush, or -1 when none yet this launch.</summary>
+        public readonly double LastFlushAgeSeconds;
+        /// <summary>The resolved ingest endpoint ("" before Init/Bootstrap).</summary>
+        public readonly string Endpoint;
+        /// <summary>Current match id ("" when unset).</summary>
+        public readonly string MatchId;
+        /// <summary>Current server id ("" when unset).</summary>
+        public readonly string ServerId;
+
+        /// <summary>Construct a diagnostics snapshot (called by <see cref="Tombstone.GetDiagnostics"/>).</summary>
+        public TombstoneDiagnostics(
+            bool initialized, bool consentGranted, int queuedOutbound, int persistedSidecar,
+            double lastFlushAgeSeconds, string endpoint, string matchId, string serverId)
+        {
+            Initialized = initialized;
+            ConsentGranted = consentGranted;
+            QueuedOutbound = queuedOutbound;
+            PersistedSidecar = persistedSidecar;
+            LastFlushAgeSeconds = lastFlushAgeSeconds;
+            Endpoint = endpoint;
+            MatchId = matchId;
+            ServerId = serverId;
+        }
+    }
+
+    /// <summary>
     /// Public entry point for the Tombstone Unity SDK. After Init (or zero-code auto-init) it
     /// runs autonomously: captures managed C# exceptions (Unity log, unobserved Tasks,
     /// AppDomain — deduped per signature), session heartbeats, breadcrumbs, a rolling session
@@ -61,6 +100,8 @@ namespace AnkleBreaker.Tombstone
         private const int EVENT_JSON_CAPACITY = 256;
         private const int CRASH_DEDUPE_WINDOW_SECONDS = 60;
         private const int MAX_TRACKED_SIGNATURES = 64;
+        // §K1: bound on the per-name sample-rate map so a misbehaving game can't grow it unbounded.
+        private const int MAX_SAMPLE_RATES = 128;
 
         private const string UNCLEAN_SIGNATURE = "unclean-shutdown";
         private const string UNCLEAN_STACK_HINT =
@@ -81,6 +122,9 @@ namespace AnkleBreaker.Tombstone
         private static bool _autoCaptureExceptions = true;
         private static bool _uploadLogs = true;
         private static bool _detectUncleanShutdown = true;
+        // v0.9 autonomy toggles — default ON; overridden from TombstoneConfigSO at auto-init.
+        private static bool _autoRttMetric = true;        // §K1: auto tombstone.rtt_ms after each ingest POST
+        private static bool _autoSceneBreadcrumbs = true; // §K2: auto breadcrumb on scene load / active change
         private static string _endpoint;
         private static string _gameToken;
         private static string _sessionId;
@@ -124,8 +168,25 @@ namespace AnkleBreaker.Tombstone
         private static int _breadcrumbCount;
         private static readonly object _breadcrumbLock = new object();
 
+        // §K1 per-name sampling: a bounded map of name → keep-probability [0,1], applied before an
+        // event/metric is buffered so a high-frequency name can't saturate the batch. Guarded by a
+        // lock (TrackEvent/TrackMetric can be called off the main thread). The RNG is thread-static
+        // so the sampler never contends or shares mutable state across threads.
+        private static readonly Dictionary<string, float> _sampleRates =
+            new Dictionary<string, float>(StringComparer.Ordinal);
+        private static readonly object _sampleLock = new object();
+        [ThreadStatic] private static Random _sampleRng;
+
+        // §K3 editor live-tail: raised fail-silently on each captured crumb/event/metric/crash so the
+        // editor-only Live Tail window can subscribe. Null (no subscriber) in shipped builds → the
+        // guard is a single reference read and nothing is formatted/allocated on the hot path.
+        internal static event Action<string> OnTelemetry;
+
         /// <summary>True while capture + upload is permitted (Init done and consent granted).</summary>
         internal static bool CaptureAllowed => _initialized && _consent;
+
+        /// <summary>§K1: whether the auto round-trip metric (tombstone.rtt_ms) is enabled (read by the upload host).</summary>
+        internal static bool AutoRttMetricEnabled => _autoRttMetric;
 
         /// <summary>Current user id ("" or null when anonymous) for heartbeat attribution.</summary>
         internal static string CurrentUserId => _userId;
@@ -152,6 +213,8 @@ namespace AnkleBreaker.Tombstone
                 _autoCaptureExceptions = config.AutoCaptureExceptions;
                 _uploadLogs = config.UploadLogs;
                 _detectUncleanShutdown = config.DetectUncleanShutdown;
+                _autoRttMetric = config.AutoRttMetric;
+                _autoSceneBreadcrumbs = config.AutoSceneBreadcrumbs;
                 Init(config.GameToken, config.Endpoint, config.HeartbeatIntervalSeconds);
             }
             catch (Exception e)
@@ -204,6 +267,7 @@ namespace AnkleBreaker.Tombstone
                 Application.quitting += onQuitting;
 
                 TombstoneBehaviour.Bootstrap(_endpoint, _gameToken, _sessionId, heartbeatIntervalSeconds);
+                if (_autoSceneBreadcrumbs) hookSceneBreadcrumbs();
                 if (CaptureAllowed) startSessionTracking();
             }
             catch (Exception e)
@@ -463,6 +527,9 @@ namespace AnkleBreaker.Tombstone
             try
             {
                 if (!CaptureAllowed || string.IsNullOrEmpty(name)) return;
+                // §K1: per-name sampling, applied BEFORE building/buffering so a dropped item costs
+                // nothing beyond the cheap sampler check (no JSON allocation).
+                if (!passesSample(name)) return;
                 // Hand-built JSON: JsonUtility can't serialize dictionaries, and absent optionals
                 // must be OMITTED (an empty-string `level` would fail the server's enum).
                 var sb = new StringBuilder(EVENT_JSON_CAPACITY);
@@ -482,6 +549,7 @@ namespace AnkleBreaker.Tombstone
                 // Batched (§16): accumulated into the bounded event buffer and flushed on
                 // count/age/near-full/pause/quit/pre-crash, instead of one POST per event.
                 TombstoneBehaviour.AddEvent(sb.ToString());
+                raiseTelemetry("event", name);
             }
             catch (Exception e)
             {
@@ -503,6 +571,8 @@ namespace AnkleBreaker.Tombstone
             {
                 if (!CaptureAllowed || string.IsNullOrEmpty(name)) return;
                 if (double.IsNaN(value) || double.IsInfinity(value)) return; // never ship a bad sample
+                // §K1: per-name sampling, applied before building/buffering (see TrackEvent).
+                if (!passesSample(name)) return;
                 // Hand-built JSON (like TrackEvent): numbers are unquoted and absent optionals are
                 // OMITTED. Each metric carries its OWN occurredAtIso — the batch's sentAtIso is added
                 // only at flush time and is never used as the sample's timestamp.
@@ -520,6 +590,7 @@ namespace AnkleBreaker.Tombstone
                 appendCorrelation(sb, ref first);
                 sb.Append('}');
                 TombstoneBehaviour.AddMetric(sb.ToString());
+                raiseTelemetry("metric", name);
             }
             catch (Exception e)
             {
@@ -561,6 +632,117 @@ namespace AnkleBreaker.Tombstone
             {
                 TombstoneLog.Warn($"AddBreadcrumb failed: {e.Message}");
             }
+        }
+
+        /// <summary>
+        /// §K1: set a per-name keep-probability for <see cref="TrackMetric"/> / <see cref="TrackEvent"/>.
+        /// A high-frequency name can be sampled down so it can't saturate the batch buffer. The rate is
+        /// clamped to [0,1] (1 = keep all, the default for any unset name; 0 = drop all). Sampling is
+        /// applied before buffering. The map is bounded (<see cref="MAX_SAMPLE_RATES"/> names); once full,
+        /// new names are ignored (existing rates can still be updated). Fail-silent; thread-safe.
+        /// </summary>
+        /// <param name="name">The exact metric/event name to sample (case-sensitive).</param>
+        /// <param name="rate0to1">Keep-probability in [0,1]; values outside the range are clamped.</param>
+        public static void SetSampleRate(string name, float rate0to1)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(name)) return;
+                float clamped = rate0to1 < 0f ? 0f : (rate0to1 > 1f ? 1f : rate0to1);
+                lock (_sampleLock)
+                {
+                    if (!_sampleRates.ContainsKey(name) && _sampleRates.Count >= MAX_SAMPLE_RATES) return;
+                    _sampleRates[name] = clamped;
+                }
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"SetSampleRate failed: {e.Message}");
+            }
+        }
+
+        /// <summary>Deterministic-per-call sampler: keep when no rate is set (default), keep/drop by a
+        /// random draw otherwise. Allocation-free on the no-rate fast path. Thread-safe.</summary>
+        private static bool passesSample(string name)
+        {
+            float rate;
+            lock (_sampleLock)
+            {
+                if (!_sampleRates.TryGetValue(name, out rate)) return true; // no rate → always keep
+            }
+            if (rate >= 1f) return true;
+            if (rate <= 0f) return false;
+            var rng = _sampleRng ?? (_sampleRng = new Random());
+            return rng.NextDouble() < rate;
+        }
+
+        /// <summary>
+        /// §K3: snapshot the current SDK state for diagnostics overlays / support tooling. Returns a
+        /// small value struct; allocates nothing in steady state beyond the returned struct on call.
+        /// Fail-silent — returns <c>default</c> if anything goes wrong.
+        /// </summary>
+        public static TombstoneDiagnostics GetDiagnostics()
+        {
+            try
+            {
+                return new TombstoneDiagnostics(
+                    _initialized,
+                    _consent,
+                    TombstoneBehaviour.OutboundCount,
+                    TombstoneBehaviour.PersistedCount,
+                    TombstoneBehaviour.LastFlushAgeSeconds,
+                    TombstoneBehaviour.Endpoint,
+                    _matchId ?? string.Empty,
+                    _serverId ?? string.Empty);
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"GetDiagnostics failed: {e.Message}");
+                return default;
+            }
+        }
+
+        /// <summary>§K2: subscribe scene-change breadcrumbs (idempotent; main thread, at Init).</summary>
+        private static bool _sceneHooksInstalled;
+        private static void hookSceneBreadcrumbs()
+        {
+            try
+            {
+                if (_sceneHooksInstalled) return;
+                UnityEngine.SceneManagement.SceneManager.sceneLoaded += onSceneLoaded;
+                UnityEngine.SceneManagement.SceneManager.activeSceneChanged += onActiveSceneChanged;
+                _sceneHooksInstalled = true;
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"scene breadcrumb hook failed: {e.Message}");
+            }
+        }
+
+        private static void unhookSceneBreadcrumbs()
+        {
+            if (!_sceneHooksInstalled) return;
+            try
+            {
+                UnityEngine.SceneManagement.SceneManager.sceneLoaded -= onSceneLoaded;
+                UnityEngine.SceneManagement.SceneManager.activeSceneChanged -= onActiveSceneChanged;
+            }
+            catch { /* shutdown path must never throw */ }
+            _sceneHooksInstalled = false;
+        }
+
+        private static void onSceneLoaded(
+            UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
+        {
+            try { AddBreadcrumb($"scene loaded: {scene.name}", BreadcrumbLevel.Info, "scene"); }
+            catch { /* scene callback must never throw into engine code */ }
+        }
+
+        private static void onActiveSceneChanged(
+            UnityEngine.SceneManagement.Scene from, UnityEngine.SceneManagement.Scene to)
+        {
+            try { AddBreadcrumb($"active scene changed: {from.name} -> {to.name}", BreadcrumbLevel.Info, "scene"); }
+            catch { /* scene callback must never throw into engine code */ }
         }
 
         private static void handleLog(string condition, string stackTrace, LogType type)
@@ -635,6 +817,7 @@ namespace AnkleBreaker.Tombstone
             TombstoneBehaviour.FlushBatches();
             TombstoneBehaviour.Enqueue(
                 CRASHES_PATH, JsonUtility.ToJson(payload), UploadDurability.WriteAhead, payload.log);
+            raiseTelemetry("crash", payload.stackHint);
             // Final flush in the crash path: the on-disk log must include this crash even if
             // the process dies before the upload (the write-ahead record retries next launch
             // and uploads previous-session.log).
@@ -726,6 +909,7 @@ namespace AnkleBreaker.Tombstone
         {
             try
             {
+                unhookSceneBreadcrumbs();
                 TombstoneSessionLog.FlushNow();
                 TombstoneSessionMarker.Delete();
             }
@@ -809,6 +993,19 @@ namespace AnkleBreaker.Tombstone
                 _breadcrumbHead = (_breadcrumbHead + 1) % MAX_BREADCRUMBS;
                 if (_breadcrumbCount < MAX_BREADCRUMBS) _breadcrumbCount++;
             }
+            // Raise OUTSIDE the lock so a slow editor subscriber never stalls capture.
+            raiseTelemetry("crumb", message);
+        }
+
+        /// <summary>§K3: raise the editor live-tail telemetry event, fail-silently. Allocation-free when
+        /// there is no subscriber (shipped builds): the handler reference read short-circuits before any
+        /// string is built, and the kind/detail concat happens only when the editor window is listening.</summary>
+        private static void raiseTelemetry(string kind, string detail)
+        {
+            var handler = OnTelemetry;
+            if (handler == null) return;
+            try { handler(kind + ": " + detail); }
+            catch { /* a faulty subscriber must never throw into capture/game code */ }
         }
 
         /// <summary>Drop the buffered breadcrumb trail (consent revoked). Resets the ring without

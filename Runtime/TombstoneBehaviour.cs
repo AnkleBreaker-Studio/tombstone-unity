@@ -55,6 +55,8 @@ namespace AnkleBreaker.Tombstone
         private const float LOG_FLUSH_INTERVAL_SECONDS = 5f;
         private const int LOG_UPLOAD_TIMEOUT_SECONDS = 30;
         private const string CONTENT_TYPE_TEXT_PLAIN = "text/plain";
+        // §K1: name of the auto round-trip metric emitted after each successful ingest POST.
+        private const string RTT_METRIC_NAME = "tombstone.rtt_ms";
 
         private static readonly ConcurrentQueue<PendingUpload> _outbound = new ConcurrentQueue<PendingUpload>();
         // Bounded, preallocated event/metric batch buffers (§16/§15): cap 256, flush at 50 items or
@@ -72,6 +74,8 @@ namespace AnkleBreaker.Tombstone
         // The preserved previous-session.log uploads at most once per launch, even if several
         // restored reports each get granted a presign.
         private static int _previousLogClaimed;
+        // §K3 diagnostics: monotonic seconds of the last batch flush (≤0 ⇒ none yet this launch).
+        private static double _lastFlushAtSeconds;
 
         private string _endpoint;
         private string _gameToken;
@@ -82,6 +86,20 @@ namespace AnkleBreaker.Tombstone
 
         /// <summary>True when the offline queue held a crash report from a previous session.</summary>
         internal static bool HasRestoredCrash => _hasRestoredCrash;
+
+        /// <summary>§K3: count of payloads waiting in the in-memory outbound queue.</summary>
+        internal static int OutboundCount => _outbound.Count;
+
+        /// <summary>§K3: count of write-ahead payloads persisted to the offline sidecar directory.</summary>
+        internal static int PersistedCount => _persistedCount;
+
+        /// <summary>§K3: seconds since the last event/metric batch flush, or -1 when none has happened
+        /// yet this launch. Uses the monotonic batch clock (never runs backward).</summary>
+        internal static double LastFlushAgeSeconds =>
+            _lastFlushAtSeconds <= 0 ? -1.0 : monotonic() - _lastFlushAtSeconds;
+
+        /// <summary>§K3: the resolved ingest endpoint this host is sending to ("" before Bootstrap).</summary>
+        internal static string Endpoint => _instance != null ? _instance._endpoint ?? "" : "";
 
         /// <summary>Create the hidden singleton host and start the heartbeat + upload loops.</summary>
         internal static void Bootstrap(string endpoint, string gameToken, string sessionId, float heartbeatIntervalSeconds)
@@ -178,6 +196,7 @@ namespace AnkleBreaker.Tombstone
             if (!batch.HasItems) return;
             var envelope = batch.DrainEnvelope(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
             if (envelope == null) return;
+            _lastFlushAtSeconds = monotonic(); // §K3 diagnostics: stamp the last-flush time
             enqueueOutbound(PendingUpload.Post(path, envelope, UploadDurability.PersistOnFailure, null, false, false));
         }
 
@@ -189,33 +208,42 @@ namespace AnkleBreaker.Tombstone
         // the queue drain no-ops and the log flush is a no-op call when the buffer is empty.
         private void Update()
         {
-            while (_inFlight < MAX_CONCURRENT_UPLOADS && _outbound.TryDequeue(out var item))
+            try
             {
-                StartCoroutine(send(item));
+                while (_inFlight < MAX_CONCURRENT_UPLOADS && _outbound.TryDequeue(out var item))
+                {
+                    StartCoroutine(send(item));
+                }
+                // Age-trigger flush so low-volume games still report within FlushAgeSeconds. Cheap locked
+                // reads; no allocation when nothing is due.
+                double m = monotonic();
+                if (_eventBatch.ShouldFlushByAge(m)) flushOne(_eventBatch, EVENTS_BATCH_PATH);
+                if (_metricBatch.ShouldFlushByAge(m)) flushOne(_metricBatch, METRICS_BATCH_PATH);
+                if (Time.unscaledTime >= _nextLogFlushAt)
+                {
+                    _nextLogFlushAt = Time.unscaledTime + LOG_FLUSH_INTERVAL_SECONDS;
+                    TombstoneSessionLog.RequestFlush();
+                }
             }
-            // Age-trigger flush so low-volume games still report within FlushAgeSeconds. Cheap locked
-            // reads; no allocation when nothing is due.
-            double m = monotonic();
-            if (_eventBatch.ShouldFlushByAge(m)) flushOne(_eventBatch, EVENTS_BATCH_PATH);
-            if (_metricBatch.ShouldFlushByAge(m)) flushOne(_metricBatch, METRICS_BATCH_PATH);
-            if (Time.unscaledTime >= _nextLogFlushAt)
-            {
-                _nextLogFlushAt = Time.unscaledTime + LOG_FLUSH_INTERVAL_SECONDS;
-                TombstoneSessionLog.RequestFlush();
-            }
+            // Fail-silent: an exception escaping Update is logged per-frame by Unity and would be
+            // re-captured by handleLog. Swallow via the [Tombstone]-prefixed logger (filtered from
+            // breadcrumbs) to honor the fail-silent contract and break the feedback loop.
+            catch (System.Exception e) { TombstoneLog.Warn("flush failed: " + e.Message); }
         }
 
         // Unity message — flush buffered analytics when backgrounded (mobile) so a suspended/killed
         // app still reports. Engine-invoked; must stay PascalCase.
         private void OnApplicationPause(bool paused)
         {
-            if (paused) FlushBatches();
+            try { if (paused) FlushBatches(); }
+            catch (System.Exception e) { TombstoneLog.Warn("flush failed: " + e.Message); }
         }
 
         // Unity message — final flush on quit (complements Tombstone.onQuitting's log flush).
         private void OnApplicationQuit()
         {
-            FlushBatches();
+            try { FlushBatches(); }
+            catch (System.Exception e) { TombstoneLog.Warn("flush failed: " + e.Message); }
         }
 
         private void loadPersistedQueue()
@@ -298,14 +326,45 @@ namespace AnkleBreaker.Tombstone
             {
                 var req = buildRequest(item);
                 if (req == null) yield break;
+                // §K1: time the round trip with the monotonic Stopwatch clock (zero-alloc — no
+                // Stopwatch instance), so a successful ingest POST can emit a tombstone.rtt_ms metric.
+                long startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 yield return req.SendWebRequest();
+                bool success = req.result == UnityWebRequest.Result.Success;
                 handleResult(item, req);
                 req.Dispose();
+                maybeEmitRtt(item, success, startTicks);
             }
             finally
             {
                 _inFlight--;
             }
+        }
+
+        /// <summary>True for the ingest ingestion endpoints (crashes/bug-reports/events/heartbeats and
+        /// the events:batch/metrics:batch routes) — the only paths that get signed (§S3) and RTT-timed
+        /// (§K1). The editor and pull-request endpoints are deliberately excluded.</summary>
+        private static bool isIngestPath(string path)
+            => path != null && path.StartsWith("/api/v1/ingest/", StringComparison.Ordinal);
+
+        /// <summary>
+        /// §K1: after a successful ingest POST, emit the round-trip time as a <c>tombstone.rtt_ms</c>
+        /// metric via the normal TrackMetric batch path. Opt-in via <see cref="Tombstone.AutoRttMetricEnabled"/>
+        /// (default ON). Recursion guard: the metrics:batch send is skipped, so emitting the RTT metric
+        /// can never trigger measuring the RTT metric's own batch. Fail-silent.
+        /// </summary>
+        private void maybeEmitRtt(PendingUpload item, bool success, long startTicks)
+        {
+            try
+            {
+                if (!success || !Tombstone.AutoRttMetricEnabled) return;
+                if (item.IsLogPut || !isIngestPath(item.Path)) return;
+                if (item.Path == METRICS_BATCH_PATH) return; // gate: don't measure the RTT metric's own batch
+                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks) * 1000.0
+                            / System.Diagnostics.Stopwatch.Frequency;
+                Tombstone.TrackMetric(RTT_METRIC_NAME, ms, "ms");
+            }
+            catch (System.Exception e) { TombstoneLog.Warn("rtt metric failed: " + e.Message); }
         }
 
         /// <summary>Build the request; returns null (never throws) on internal failure.
@@ -329,6 +388,15 @@ namespace AnkleBreaker.Tombstone
                 req.downloadHandler = new DownloadHandlerBuffer();
                 req.SetRequestHeader("Content-Type", "application/json");
                 req.SetRequestHeader("Authorization", "Bearer " + _gameToken);
+                // §S3: HMAC-sign ingest POSTs only (NOT editor/pull endpoints). Fail-silent — a null
+                // header means signing failed and the request goes out unsigned (server allows unsigned
+                // during rollout). The HMAC is computed over the serialized body at send time (already
+                // off the main game-frame path).
+                if (isIngestPath(item.Path))
+                {
+                    var signature = TombstoneSign.BuildHeader(_gameToken, item.Body);
+                    if (signature != null) req.SetRequestHeader("X-Tombstone-Signature", signature);
+                }
                 req.timeout = REQUEST_TIMEOUT_SECONDS;
                 return req;
             }
@@ -467,9 +535,11 @@ namespace AnkleBreaker.Tombstone
                     var payload = new PullFulfillPayload
                     {
                         userId = Tombstone.CurrentUserId,                          // null → "" via JsonUtility; server cleans it
-                        sessionId = _sessionId,
+                        sessionId = _sessionId,                                    // the session this client heartbeated with
                         matchId = string.IsNullOrEmpty(matchId) ? null : matchId,
                         serverId = string.IsNullOrEmpty(serverId) ? null : serverId,
+                        nonce = p.fulfillNonce,                                    // present the fulfilment nonce from the ack
+                        nonceExpiry = p.nonceExpiry,
                     };
                     // requestLog:true → the fulfil 2xx's data.logUpload is chased exactly like a crash/bug,
                     // reusing scheduleLogUpload (log read ≤512 KB on the ThreadPool, never the main thread).

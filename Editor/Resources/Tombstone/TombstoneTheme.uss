@@ -329,3 +329,24 @@
 
 /* ——— Loading dots ——— */
 .tmb-loading { color: var(--tmb-gold); font-size: 11px; letter-spacing: 2px; }
+
+/* ——— Live Tail ——— */
+.tmb-livetail {
+    flex-grow: 1;
+    margin-top: 10px;
+    background-color: var(--tmb-bg-900);
+    border-width: 1px;
+    border-color: var(--tmb-line);
+    border-radius: 6px;
+    padding: 4px 6px;
+}
+.tmb-livetail__row {
+    color: var(--tmb-text);
+    font-size: 11px;
+    -unity-font-style: normal;
+    padding: 2px 4px;
+    border-bottom-width: 1px;
+    border-bottom-color: var(--tmb-line);
+    white-space: normal;
+}
+.tmb-livetail__row:hover { background-color: var(--tmb-gold-wash); }

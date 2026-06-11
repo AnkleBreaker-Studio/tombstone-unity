@@ -35,6 +35,12 @@ namespace AnkleBreaker.Tombstone
         [Tooltip("On launch, detect a previous session that ended without a clean shutdown (hard crash, OOM kill, force quit) and report it with the preserved log.")]
         [SerializeField] private bool _detectUncleanShutdown = true;
 
+        [Tooltip("Automatically emit a 'tombstone.rtt_ms' metric measuring the round-trip time of each successful ingest upload.")]
+        [SerializeField] private bool _autoRttMetric = true;
+
+        [Tooltip("Automatically add a breadcrumb when a scene loads or the active scene changes.")]
+        [SerializeField] private bool _autoSceneBreadcrumbs = true;
+
         public string Endpoint => _endpoint;
         public string GameToken => _gameToken;
         public bool AutoInitOnLoad => _autoInitOnLoad;
@@ -43,5 +49,7 @@ namespace AnkleBreaker.Tombstone
         public bool AutoCaptureExceptions => _autoCaptureExceptions;
         public bool UploadLogs => _uploadLogs;
         public bool DetectUncleanShutdown => _detectUncleanShutdown;
+        public bool AutoRttMetric => _autoRttMetric;
+        public bool AutoSceneBreadcrumbs => _autoSceneBreadcrumbs;
     }
 }

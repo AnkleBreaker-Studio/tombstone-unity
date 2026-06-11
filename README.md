@@ -184,9 +184,15 @@ Tombstone.SetUser(userId, steamId = null);
 Tombstone.SetConsent(bool granted);
 Tombstone.TrackEvent(name, Dictionary<string,string> props = null);
 Tombstone.TrackMetric(name, double value, string unit = null);
+Tombstone.SetSampleRate(name, float rate0to1);   // per-name keep-probability for events/metrics
 Tombstone.AddBreadcrumb(message, BreadcrumbLevel level = Info, category = null);
 Tombstone.ReportException(exception);
 Tombstone.ReportBug(message, category = null);
+
+// Diagnostics snapshot (support overlays / dev HUDs) — readonly struct, no steady-state alloc
+TombstoneDiagnostics diag = Tombstone.GetDiagnostics();
+// diag.Initialized / ConsentGranted / QueuedOutbound / PersistedSidecar /
+// diag.LastFlushAgeSeconds / Endpoint / MatchId / ServerId
 
 // Multiplayer correlation context (dedicated servers)
 Tombstone.SetMatchContext(serverId, matchId);

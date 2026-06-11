@@ -2,6 +2,60 @@
 
 All notable changes to `com.anklebreaker.tombstone`.
 
+## [0.9.0] - 2026-06-11
+### Added — fulfilment nonce (log-pull authenticity)
+- The heartbeat ack now carries, per pending request, a `fulfillNonce` (string) and `nonceExpiry`
+  (number) alongside `requestId`/`targetType`/`targetValue`. When a targeted, consenting client
+  honours a pull, the fulfil POST body now echoes `nonce` + `nonceExpiry` (and the `sessionId` it
+  heartbeated with) so the server can authenticate the fulfilment and reject a stale nonce. Wire
+  body: `{ userId?, sessionId, matchId?, serverId?, nonce, nonceExpiry }`. `PullRequestDto` /
+  `PullFulfillPayload` updated (additive — older servers leave the nonce fields empty/`0`).
+### Added — request signing (HMAC, §S3)
+- Every **ingest** POST (crashes, bug-reports, events, heartbeats, events:batch, metrics:batch — NOT
+  the editor/pull endpoints) now carries an `X-Tombstone-Signature` header:
+  `t=<unixSec>,v1=<hex HMAC_SHA256(ingestKey, t + "." + rawBody)>`, keyed with the SDK token already
+  sent as the Bearer ingest key (`System.Security.Cryptography.HMACSHA256`). Computed at send time
+  (off the main game-frame path); the HMAC primitive + hex buffer are reused across requests.
+  **Fail-silent** — if signing throws, the request is sent unsigned (the server accepts unsigned
+  during rollout). New file `TombstoneSign.cs`.
+### Added — auto network-RTT metric + per-name sampling (§K1)
+- After each successful **ingest** POST the SDK measures the round trip with `Stopwatch` and emits a
+  `tombstone.rtt_ms` metric (unit `ms`) via the normal `TrackMetric` batch path. Opt-in via the
+  config flag `_autoRttMetric` (default ON). Recursion-guarded — the metrics:batch send is never
+  measured, so the RTT metric can't measure its own batch.
+- **`Tombstone.SetSampleRate(string name, float rate0to1)`** — per-name keep-probability [0,1]
+  (deterministic/random sampler) applied **before** an event/metric is buffered, so a high-frequency
+  name can't saturate the batch. Bounded map (128 names); unset names always keep. Fail-silent.
+### Added — auto scene breadcrumbs (§K2)
+- Hooks `SceneManager.sceneLoaded` and `activeSceneChanged` at Init to auto-`AddBreadcrumb`
+  (`"scene loaded: {name}"` / `"active scene changed: {from} -> {to}"`, category `scene`). Config
+  flag `_autoSceneBreadcrumbs` (default ON); unhooked on shutdown. Zero alloc beyond the breadcrumb string.
+### Added — diagnostics API + editor live-tail (§K3)
+- **`Tombstone.GetDiagnostics()`** → `TombstoneDiagnostics` (readonly struct): `Initialized`,
+  `ConsentGranted`, `QueuedOutbound`, `PersistedSidecar`, `LastFlushAgeSeconds`, `Endpoint`,
+  `MatchId`, `ServerId`. No steady-state allocation beyond the returned struct.
+- **Live Tail window** (`Window ▸ Tombstone ▸ Live Tail`, UI Toolkit, forge-dark USS, editor-only):
+  in Play mode it subscribes to a new lightweight `internal static event Action<string>
+  Tombstone.OnTelemetry` (raised fail-silently on each captured crumb/event/metric/crash) and shows
+  a bounded scrolling list. The event is null (no subscriber) in shipped builds, so the hot path
+  stays allocation-free.
+### Changed
+- `TombstoneConfigSO` gains `_autoRttMetric` and `_autoSceneBreadcrumbs` (both default ON). Wire
+  shapes are additive — `tests/unity-contract.test.ts` stays authoritative for the ingest contract.
+
+## [0.8.1] - 2026-06-11
+### Fixed
+- **Fail-silent flush guards (§15)** — wrapped the age-trigger flush in `Update()` and the
+  `OnApplicationPause`/`OnApplicationQuit` flush handlers in try/catch, matching `TrackEvent`/
+  `TrackMetric`. An exception escaping `Update` was previously logged per-frame by Unity and
+  re-captured by the log hook, risking a breadcrumb feedback loop and breaching the fail-silent
+  contract. Failures now funnel through the `[Tombstone]`-prefixed internal logger (filtered from
+  breadcrumbs); behaviour is otherwise unchanged.
+### Changed
+- **G17 numeric round-trip** — `TombstoneJson.AppendNumberField` now formats doubles with `"G17"`
+  (Microsoft's recommended round-trip specifier) instead of `"R"`, keeping `CultureInfo.InvariantCulture`.
+  Still emits a valid finite JSON number; the wire shape and contract test are unchanged.
+
 ## [0.8.0] - 2026-06-11
 ### Added — log-pull control plane (server-triggered session-log retrieval)
 - **`Tombstone.RequestPlayerLogs(PullTarget target, string targetValue, string reason)`** — server-side
