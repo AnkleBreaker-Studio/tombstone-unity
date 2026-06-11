@@ -21,11 +21,15 @@ cases with **zero further integration**:
 | Unclean shutdown (hard crash / OOM kill / force quit) | ✅ Automatic (next launch) | `session.lock` marker + preserved `previous-session.log`, reported as signature `unclean-shutdown` |
 | Session heartbeats / CCU | ✅ Automatic | Every N seconds (default 60) |
 | Offline durability + retry | ✅ Automatic | Write-ahead queue, exponential backoff, next-launch retry |
+| Event + metric batching (§16) | ✅ Automatic | `TrackEvent`/`TrackMetric` accumulate in a bounded, preallocated, drop-oldest buffer (cap 256) and flush as one batch on count ≥ 50 / age ≥ 10s / near-full / pause / quit / pre-crash |
 | Player identification | One-liner | `Tombstone.SetUser("user-123", steamId)` |
-| Analytics events | One-liner | `Tombstone.TrackEvent("level_complete", props)` |
+| Analytics events (batched) | One-liner | `Tombstone.TrackEvent("level_complete", props)` |
+| Numeric metrics (batched) | One-liner | `Tombstone.TrackMetric("tickrate", 60, "hz")` |
 | Player bug reports (log attached automatically) | One-liner | `Tombstone.ReportBug("…", category)` |
 | Manual breadcrumbs | One-liner | `Tombstone.AddBreadcrumb("…", level, category)` |
 | Caught-but-interesting exceptions | One-liner | `Tombstone.ReportException(ex)` |
+| Server-triggered log pull — client honouring | ✅ Automatic | The heartbeat ack carries pull requests; a **consenting**, **targeted** client uploads its rolling session log via the existing presigned-log path, off-thread. A non-consenting client never uploads. |
+| Server-side log pull (request a player's logs) | One-liner | `Tombstone.RequestPlayerLogs(...)` / `Tombstone.OnAnomalousDisconnect(userId, reason)` (write-scoped server token) |
 
 All three autonomy systems can be toggled on the config asset (`Auto Capture Exceptions`,
 `Upload Logs`, `Detect Unclean Shutdown` — default ON) and are consent-gated: with
@@ -90,9 +94,13 @@ Tombstone.Init("tmb_…", "https://your-tenant.example.com");   // once, at boot
 Tombstone.SetConsent(true);                                    // GDPR / store-policy gate
 Tombstone.SetUser("user-123", steamId: "7656119…");            // once auth resolves
 
-// Analytics events (events & funnels screens)
+// Analytics events (events & funnels screens) — batched, flushed on count/age/pause/quit
 Tombstone.TrackEvent("level_complete",
     new Dictionary<string, string> { { "level", "3" }, { "difficulty", "hard" } });
+
+// Numeric metrics (time-series, p50/p95/p99) — batched alongside events
+Tombstone.TrackMetric("tickrate", 60, "hz");
+Tombstone.TrackMetric("rtt_ms", 42.5, "ms");
 
 // Breadcrumbs: the log trail attached to the next crash / bug report
 Tombstone.AddBreadcrumb("matchmaking started", BreadcrumbLevel.Info, category: "net");
@@ -128,9 +136,33 @@ try { Load(); } catch (Exception e) { Tombstone.ReportException(e); }
 - **Session heartbeats** → `POST /api/v1/ingest/heartbeats` every N seconds (default 60,
   clamped 15–600) with `sessionId`/`buildVersion`/`os`/`arch`/`userId` — feeds the Live
   Fleet/CCU, Sessions, and Releases screens.
-- **Analytics events** → `Tombstone.TrackEvent(name, props)` → `POST /api/v1/ingest/events`
-  (flat attributes, clamped to the server contract: ≤32 entries, 64-char keys, 512-char values).
+- **Analytics events** → `Tombstone.TrackEvent(name, props)` (flat attributes, clamped to the
+  server contract: ≤32 entries, 64-char keys, 512-char values).
+- **Numeric metrics** → `Tombstone.TrackMetric(name, value, unit?)` for time-series + p50/p95/p99
+  (e.g. tickrate, RTT, CCU). Finite values only — NaN/Infinity are dropped. Carries the same
+  correlation spine as events so a metric can be sliced by server / match / session / player.
+- **Event/metric batching** (§16): events and metrics are NOT sent one request at a time. They
+  accumulate in a bounded, preallocated, drop-oldest buffer (cap 256) and flush as a single
+  envelope `{ "sentAtIso", "items": [...] }` to `POST /api/v1/ingest/events:batch` /
+  `…/metrics:batch` on count ≥ 50, age ≥ 10s, near-full, app pause/quit, or a pre-crash flush.
+  Each item keeps its own `occurredAtIso`; `sentAtIso` is the send time (used for clock-skew only).
+  Sends reuse the existing queue + backoff + offline durability. Crashes, bug reports, and
+  heartbeats stay individual (forensic / time-sensitive).
 - **Bug reports** → `Tombstone.ReportBug(...)` → `POST /api/v1/ingest/bug-reports`.
+- **Server-triggered log pull** (studio- or auto-initiated, consent-gated): a dedicated game server can
+  request a player's session log when something looks wrong, without the player filing a bug report.
+  - **Server side** → `Tombstone.RequestPlayerLogs(target, value, reason)` (or the
+    `RequestPlayerLogs(target, reason)` / `OnAnomalousDisconnect(userId, reason)` convenience forms)
+    POSTs `{ targetType, targetValue, reason }` to `POST /api/v1/pull-requests` using the configured
+    **write-scoped** server token. An ingest-only client token is rejected (403) server-side — an
+    extracted client token can never request anyone's logs. The pull is queued + audit-logged.
+  - **Client side** (fully automatic, transparent): each heartbeat ack now carries
+    `data.pendingRequests`. For every queued request that targets THIS client (by
+    `userId`/`sessionId`/`matchId`/`serverId`) **and only while consent is granted**, the SDK POSTs
+    `/api/v1/pull-requests/{requestId}/fulfill` and uploads its current rolling session log through the
+    **same presigned-log path** used for crashes/bugs — off the main thread, fail-silent, with no
+    gameplay impact. A player who has not granted telemetry consent **never** uploads. Pulled logs are
+    retention-TTL'd like other telemetry and removed by a data-erasure request.
 - **Breadcrumbs**: every Unity log line + manual `AddBreadcrumb(...)` entries land in a fixed
   50-entry ring buffer (zero allocations beyond the stored strings) and ride along on crashes
   and bug reports.
@@ -151,9 +183,20 @@ Tombstone.Init(gameToken, endpoint, heartbeatIntervalSeconds = 60f);
 Tombstone.SetUser(userId, steamId = null);
 Tombstone.SetConsent(bool granted);
 Tombstone.TrackEvent(name, Dictionary<string,string> props = null);
+Tombstone.TrackMetric(name, double value, string unit = null);
 Tombstone.AddBreadcrumb(message, BreadcrumbLevel level = Info, category = null);
 Tombstone.ReportException(exception);
 Tombstone.ReportBug(message, category = null);
+
+// Multiplayer correlation context (dedicated servers)
+Tombstone.SetMatchContext(serverId, matchId);
+string matchId = Tombstone.StartMatch();   // server: flips role to "server", mints a match id
+Tombstone.EndMatch();
+
+// Server-triggered log pull (write-scoped server token)
+Tombstone.RequestPlayerLogs(Tombstone.PullTarget target, targetValue, reason);
+Tombstone.RequestPlayerLogs(target, reason);          // target = userId, or Tombstone.TARGET_ALL_ON_THIS_SERVER
+Tombstone.OnAnomalousDisconnect(userId, reason);
 ```
 
 ## Conventions

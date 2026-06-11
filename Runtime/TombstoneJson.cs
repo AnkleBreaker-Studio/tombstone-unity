@@ -53,6 +53,17 @@ namespace AnkleBreaker.Tombstone
             AppendString(sb, value);
         }
 
+        /// <summary>Append a numeric JSON field (unquoted, invariant-culture). Used by TrackMetric —
+        /// invariant culture so a comma-decimal locale can't corrupt the JSON, and round-trip ("R")
+        /// formatting so the sample's full double precision survives.</summary>
+        internal static void AppendNumberField(StringBuilder sb, string key, double value, ref bool first)
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append('"').Append(key).Append("\":")
+              .Append(value.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        }
+
         /// <summary>
         /// Append <c>,"attributes":{...}</c> from string props, clamped to the server contract
         /// (at most <paramref name="maxEntries"/> entries; key/value length clamps). Empty or

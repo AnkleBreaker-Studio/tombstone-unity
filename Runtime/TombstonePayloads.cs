@@ -36,6 +36,14 @@ namespace AnkleBreaker.Tombstone
         /// session log). JsonUtility serializes <c>false</c> when unset — the server treats
         /// <c>"log":false</c> as no-log, so the plain bool field is contract-safe.</summary>
         public bool log;
+        /// <summary>Correlation: emitter role — "client" (default) or "server" (after StartMatch).</summary>
+        public string role;
+        /// <summary>Correlation: server id set via <see cref="Tombstone.SetMatchContext"/> ("" when unset).</summary>
+        public string serverId;
+        /// <summary>Correlation: match id (SetMatchContext / StartMatch); "" when unset (server cleans to undefined).</summary>
+        public string matchId;
+        /// <summary>Correlation: this launch's session id (GUID minted at Init).</summary>
+        public string sessionId;
     }
 
     /// <summary>One entry of the recent-log trail attached to crashes and bug reports.</summary>
@@ -75,6 +83,14 @@ namespace AnkleBreaker.Tombstone
         /// <summary>When true the server returns <c>data.logUpload</c> (presigned PUT for the
         /// session log). Same JsonUtility quirk/contract note as <see cref="CrashPayload.log"/>.</summary>
         public bool log;
+        /// <summary>Correlation: emitter role — "client" (default) or "server" (after StartMatch).</summary>
+        public string role;
+        /// <summary>Correlation: server id set via <see cref="Tombstone.SetMatchContext"/> ("" when unset).</summary>
+        public string serverId;
+        /// <summary>Correlation: match id (SetMatchContext / StartMatch); "" when unset (server cleans to undefined).</summary>
+        public string matchId;
+        /// <summary>Correlation: this launch's session id (GUID minted at Init).</summary>
+        public string sessionId;
     }
 
     /// <summary>Session heartbeat wire shape for <c>POST /api/v1/ingest/heartbeats</c> (CCU / Sessions / Fleet).</summary>
@@ -93,6 +109,12 @@ namespace AnkleBreaker.Tombstone
         public string arch;
         /// <summary>Player id set via <see cref="Tombstone.SetUser"/> ("" when anonymous) — feeds the Sessions screen.</summary>
         public string userId;
+        /// <summary>Correlation: emitter role — "client" (default) or "server" (after StartMatch) — feeds the Fleet screen.</summary>
+        public string role;
+        /// <summary>Correlation: server id set via <see cref="Tombstone.SetMatchContext"/> ("" when unset).</summary>
+        public string serverId;
+        /// <summary>Correlation: match id (SetMatchContext / StartMatch); "" when unset (server cleans to undefined).</summary>
+        public string matchId;
     }
 
     // ── Ingest response DTOs (parse-only) ───────────────────────────────────────────────────
@@ -126,5 +148,56 @@ namespace AnkleBreaker.Tombstone
         public string url;
         /// <summary>S3 object key the server stored on the crash/bug row.</summary>
         public string key;
+    }
+
+    // ── Log-pull control-plane DTOs ─────────────────────────────────────────────────────────
+    // The heartbeat 202 ack is parse-only (JsonUtility-lenient: absent fields → default, absent
+    // arrays → null). The fulfil POST body is serialized like the ingest payloads (null → "",
+    // server cleans empties via cleanOptionalId). tests/unity-contract.test.ts pins these keys
+    // against the server's pull-request schemas.
+
+    /// <summary>Envelope of the heartbeat 202 ack (<c>{"success":true,"data":{...}}</c>).</summary>
+    [Serializable]
+    internal sealed class HeartbeatAck
+    {
+        /// <summary>Server success flag (informational — HTTP status is authoritative).</summary>
+        public bool success;
+        /// <summary>Ack payload — carries the pull requests targeting this client.</summary>
+        public HeartbeatAckData data;
+    }
+
+    /// <summary>Data member of the heartbeat ack — the command channel for log-pull requests.</summary>
+    [Serializable]
+    internal sealed class HeartbeatAckData
+    {
+        /// <summary>Pull requests this client should honour (empty/absent when none).</summary>
+        public PullRequestDto[] pendingRequests;
+    }
+
+    /// <summary>One pending log-pull request handed to a client via the heartbeat ack.</summary>
+    [Serializable]
+    internal sealed class PullRequestDto
+    {
+        /// <summary>Public ULID of the request; stamped onto the fulfil URL + uploaded log.</summary>
+        public string requestId;
+        /// <summary>What <see cref="targetValue"/> identifies: userId | sessionId | matchId | server.</summary>
+        public string targetType;
+        /// <summary>The userId / sessionId / matchId / serverId this request targets.</summary>
+        public string targetValue;
+    }
+
+    /// <summary>Body the client POSTs to fulfil a pull (<c>/pull-requests/{id}/fulfill</c>) — its
+    /// asserted correlation identity, so the server can confirm the client is genuinely targeted.</summary>
+    [Serializable]
+    internal sealed class PullFulfillPayload
+    {
+        /// <summary>Player id set via <see cref="Tombstone.SetUser"/> ("" when anonymous).</summary>
+        public string userId;
+        /// <summary>This launch's session id.</summary>
+        public string sessionId;
+        /// <summary>Correlation: current match id (null when unset → omitted-equivalent server-side).</summary>
+        public string matchId;
+        /// <summary>Correlation: current server id (null when unset).</summary>
+        public string serverId;
     }
 }

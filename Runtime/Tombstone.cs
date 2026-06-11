@@ -43,11 +43,18 @@ namespace AnkleBreaker.Tombstone
         private const int MAX_CATEGORY = 32;
         private const int MAX_USER_ID = 128;
         private const int MAX_STEAM_ID = 32;
+        // A pull-request reason is clamped to the server contract's MAX_PULL_REASON (280) — NOT
+        // MAX_BUG_MESSAGE: a longer reason would be rejected (400) and dropped server-side.
+        private const int MAX_PULL_REASON = 280;
+        // Correlation ids (serverId / matchId) clamp to the server contract's max(128).
+        private const int MAX_CONTEXT_ID = 128;
         private const int SIGNATURE_FRAMES = 8;
         private const int SIGNATURE_HEX_LENGTH = 32;
         private const int MAX_BREADCRUMBS = 50;
         private const int MAX_BREADCRUMB_MESSAGE = 512;
         private const int MAX_EVENT_NAME = 64;
+        private const int MAX_METRIC_NAME = 64;
+        private const int MAX_METRIC_UNIT = 16;
         private const int MAX_EVENT_ATTRIBUTES = 32;
         private const int MAX_EVENT_ATTRIBUTE_KEY = 64;
         private const int MAX_EVENT_ATTRIBUTE_VALUE = 512;
@@ -63,6 +70,10 @@ namespace AnkleBreaker.Tombstone
         internal const string CRASHES_PATH = "/api/v1/ingest/crashes";
         private const string BUG_REPORTS_PATH = "/api/v1/ingest/bug-reports";
         private const string EVENTS_PATH = "/api/v1/ingest/events";
+        private const string PULL_REQUESTS_PATH = "/api/v1/pull-requests";
+        /// <summary>Sentinel for the <see cref="RequestPlayerLogs(string,string)"/> convenience
+        /// overload: pull every player connected to THIS dedicated server (uses the current serverId).</summary>
+        public const string TARGET_ALL_ON_THIS_SERVER = "all-on-this-server";
 
         private static volatile bool _initialized;
         private static volatile bool _consent = true;
@@ -75,6 +86,12 @@ namespace AnkleBreaker.Tombstone
         private static string _sessionId;
         private static string _userId;
         private static string _steamId;
+        // Correlation context: stamped on every payload so server<->session<->match<->player
+        // linking is exact. Defaults make a plain client send role="client" + empty ids ("" is
+        // cleaned to undefined server-side, like userId). Set via SetMatchContext/StartMatch.
+        private static string _role = "client";
+        private static string _serverId = "";
+        private static string _matchId = "";
 
         // Dirty-session state captured at Init, consumed when capture first becomes allowed.
         private static SessionMarkerData _previousMarker;
@@ -112,6 +129,15 @@ namespace AnkleBreaker.Tombstone
 
         /// <summary>Current user id ("" or null when anonymous) for heartbeat attribution.</summary>
         internal static string CurrentUserId => _userId;
+
+        /// <summary>Current emitter role ("client" | "server") for heartbeat correlation.</summary>
+        internal static string CurrentRole => _role;
+
+        /// <summary>Current server id ("" when unset) for heartbeat correlation.</summary>
+        internal static string CurrentServerId => _serverId;
+
+        /// <summary>Current match id ("" when unset) for heartbeat correlation.</summary>
+        internal static string CurrentMatchId => _matchId;
 
         /// <summary>Auto-init from a <c>Resources/TombstoneConfig</c> asset, if present and enabled.</summary>
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
@@ -156,7 +182,7 @@ namespace AnkleBreaker.Tombstone
                 _buildVersion = TombstonePlatform.BuildVersion();
                 _os = TombstonePlatform.Os();
                 _arch = TombstonePlatform.Arch();
-                _sessionId = Guid.NewGuid().ToString("N");
+                _sessionId = newId();
                 _initialized = true;
 
                 // Main-thread-only values (persistentDataPath) are cached here, like
@@ -196,6 +222,152 @@ namespace AnkleBreaker.Tombstone
         {
             _userId = truncate(userId, MAX_USER_ID);
             _steamId = truncate(steamId, MAX_STEAM_ID);
+        }
+
+        /// <summary>
+        /// Tag subsequent telemetry with the server + match it belongs to, so crashes, events,
+        /// bug reports, and heartbeats correlate to a specific dedicated server and match.
+        /// Both ids are clamped to the server contract (128 chars); pass null/"" to clear one.
+        /// Does not change the role — call <see cref="StartMatch"/> on a dedicated server.
+        /// </summary>
+        /// <param name="serverId">Your stable dedicated-server identifier (e.g. "srv-eu-1").</param>
+        /// <param name="matchId">The current match/session identifier (e.g. "m-42").</param>
+        public static void SetMatchContext(string serverId, string matchId)
+        {
+            try
+            {
+                _serverId = truncate(serverId, MAX_CONTEXT_ID) ?? "";
+                _matchId = truncate(matchId, MAX_CONTEXT_ID) ?? "";
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"SetMatchContext failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Begin a match on a dedicated server: flips the emitter role to "server" and mints a
+        /// fresh match id (returned so the caller can broadcast it to clients via
+        /// <see cref="SetMatchContext"/>). All telemetry from now until <see cref="EndMatch"/>
+        /// carries this match id and role.
+        /// </summary>
+        /// <returns>The newly minted match id (a GUID "N"); "" only if minting failed.</returns>
+        public static string StartMatch()
+        {
+            try
+            {
+                _role = "server";
+                _matchId = newId();
+                return _matchId;
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"StartMatch failed: {e.Message}");
+                return _matchId;
+            }
+        }
+
+        /// <summary>Clear the current match id (the role and server id are left intact — a
+        /// dedicated server keeps its identity between matches). Telemetry sent after this no
+        /// longer correlates to a match until the next <see cref="StartMatch"/>/<see cref="SetMatchContext"/>.</summary>
+        public static void EndMatch()
+        {
+            try
+            {
+                _matchId = "";
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"EndMatch failed: {e.Message}");
+            }
+        }
+
+        /// <summary>What a server-side log pull targets (maps 1:1 to the wire <c>targetType</c>).</summary>
+        public enum PullTarget
+        {
+            /// <summary>A single player id (<c>SetUser</c> userId).</summary>
+            UserId,
+            /// <summary>A single session id.</summary>
+            SessionId,
+            /// <summary>Every client correlated to a match id.</summary>
+            MatchId,
+            /// <summary>Every client connected to a server id (fan-out to the whole box).</summary>
+            Server,
+        }
+
+        /// <summary>
+        /// Server-side: request the session logs of a player / session / match / whole server. Requires
+        /// a WRITE-scoped server token (an ingest-only client token is rejected server-side with 403 —
+        /// surfaced via <see cref="TombstoneLog"/>, never thrown). The pull is queued; targeted clients
+        /// upload on their next heartbeat (consent-gated, client-side). Fail-silent — safe to call from
+        /// game-server code. Wire body: <c>{ "targetType", "targetValue", "reason" }</c>.
+        /// </summary>
+        /// <param name="target">What <paramref name="targetValue"/> identifies.</param>
+        /// <param name="targetValue">The userId / sessionId / matchId / serverId to pull.</param>
+        /// <param name="reason">Why (audit trail), e.g. "anomalous disconnect".</param>
+        public static void RequestPlayerLogs(PullTarget target, string targetValue, string reason)
+        {
+            try
+            {
+                // Server action, NOT player capture: gated on Init only (not consent). The consent
+                // gate is enforced on the CLIENT honouring side, where the player's bytes are read.
+                if (!_initialized || string.IsNullOrEmpty(targetValue) || string.IsNullOrEmpty(reason)) return;
+                var sb = new StringBuilder(EVENT_JSON_CAPACITY);
+                sb.Append('{');
+                bool first = true;
+                TombstoneJson.AppendField(sb, "targetType", pullTargetName(target), ref first);
+                TombstoneJson.AppendField(sb, "targetValue", truncate(targetValue, MAX_USER_ID), ref first);
+                TombstoneJson.AppendField(sb, "reason", truncate(reason, MAX_PULL_REASON), ref first);
+                sb.Append('}');
+                TombstoneBehaviour.Enqueue(PULL_REQUESTS_PATH, sb.ToString(), UploadDurability.PersistOnFailure);
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"RequestPlayerLogs failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Server-side convenience: pull a single player's logs by id, or — with
+        /// <see cref="TARGET_ALL_ON_THIS_SERVER"/> — every player connected to this dedicated server
+        /// (resolved to the current serverId). For sessionId/matchId pulls use the typed overload.
+        /// </summary>
+        /// <param name="target">A player userId, or <see cref="TARGET_ALL_ON_THIS_SERVER"/>.</param>
+        /// <param name="reason">Why (audit trail).</param>
+        public static void RequestPlayerLogs(string target, string reason)
+        {
+            try
+            {
+                if (string.Equals(target, TARGET_ALL_ON_THIS_SERVER, StringComparison.Ordinal))
+                    RequestPlayerLogs(PullTarget.Server, _serverId, reason);
+                else
+                    RequestPlayerLogs(PullTarget.UserId, target, reason);
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"RequestPlayerLogs failed: {e.Message}");
+            }
+        }
+
+        /// <summary>Server-side convenience: auto-pull a player's logs after a weird disconnect.</summary>
+        /// <param name="userId">The player whose session log to pull.</param>
+        /// <param name="reason">Why (audit trail); defaults to "anomalous disconnect" when empty.</param>
+        public static void OnAnomalousDisconnect(string userId, string reason)
+        {
+            RequestPlayerLogs(
+                PullTarget.UserId, userId, string.IsNullOrEmpty(reason) ? "anomalous disconnect" : reason);
+        }
+
+        /// <summary>Map a <see cref="PullTarget"/> to its wire <c>targetType</c> string (no enum.ToString() alloc).</summary>
+        private static string pullTargetName(PullTarget t)
+        {
+            switch (t)
+            {
+                case PullTarget.SessionId: return "sessionId";
+                case PullTarget.MatchId: return "matchId";
+                case PullTarget.Server: return "server";
+                default: return "userId";
+            }
         }
 
         /// <summary>
@@ -265,6 +437,10 @@ namespace AnkleBreaker.Tombstone
                     breadcrumbs = snapshotBreadcrumbs(),
                     // A player writing a bug report is exactly when you want their log.
                     log = _uploadLogs,
+                    role = _role,
+                    serverId = _serverId,
+                    matchId = _matchId,
+                    sessionId = _sessionId,
                 };
                 TombstoneBehaviour.Enqueue(
                     BUG_REPORTS_PATH, JsonUtility.ToJson(payload), UploadDurability.WriteAhead, payload.log);
@@ -297,17 +473,71 @@ namespace AnkleBreaker.Tombstone
                 TombstoneJson.AppendField(sb, "os", _os, ref first);
                 TombstoneJson.AppendField(sb, "arch", _arch, ref first);
                 TombstoneJson.AppendField(sb, "name", truncate(name, MAX_EVENT_NAME), ref first);
-                if (!string.IsNullOrEmpty(_userId))
-                    TombstoneJson.AppendField(sb, "userId", _userId, ref first);
+                // Correlation spine (role/serverId/matchId/userId/sessionId), omitting empty ids —
+                // shared with TrackMetric so segmentation + cross-actor funnels line up server-side.
+                appendCorrelation(sb, ref first);
                 TombstoneJson.AppendAttributes(
                     sb, props, MAX_EVENT_ATTRIBUTES, MAX_EVENT_ATTRIBUTE_KEY, MAX_EVENT_ATTRIBUTE_VALUE, ref first);
                 sb.Append('}');
-                TombstoneBehaviour.Enqueue(EVENTS_PATH, sb.ToString(), UploadDurability.PersistOnFailure);
+                // Batched (§16): accumulated into the bounded event buffer and flushed on
+                // count/age/near-full/pause/quit/pre-crash, instead of one POST per event.
+                TombstoneBehaviour.AddEvent(sb.ToString());
             }
             catch (Exception e)
             {
                 TombstoneLog.Warn($"TrackEvent failed: {e.Message}");
             }
+        }
+
+        /// <summary>
+        /// Record a numeric metric (e.g. tickrate, RTT, CCU). Batched client-side (§16) and flushed
+        /// on count/age/pause/quit/pre-crash. <paramref name="value"/> must be finite. Fail-silent;
+        /// never blocks the calling thread and never throws into game code.
+        /// </summary>
+        /// <param name="name">Metric name (required, clamped to 64 chars), e.g. "tickrate".</param>
+        /// <param name="value">Finite numeric sample (NaN/Infinity are dropped, never shipped).</param>
+        /// <param name="unit">Optional unit label (clamped to 16 chars), e.g. "ms".</param>
+        public static void TrackMetric(string name, double value, string unit = null)
+        {
+            try
+            {
+                if (!CaptureAllowed || string.IsNullOrEmpty(name)) return;
+                if (double.IsNaN(value) || double.IsInfinity(value)) return; // never ship a bad sample
+                // Hand-built JSON (like TrackEvent): numbers are unquoted and absent optionals are
+                // OMITTED. Each metric carries its OWN occurredAtIso — the batch's sentAtIso is added
+                // only at flush time and is never used as the sample's timestamp.
+                var sb = new StringBuilder(EVENT_JSON_CAPACITY);
+                sb.Append('{');
+                bool first = true;
+                TombstoneJson.AppendField(sb, "name", truncate(name, MAX_METRIC_NAME), ref first);
+                TombstoneJson.AppendNumberField(sb, "value", value, ref first);
+                if (!string.IsNullOrEmpty(unit))
+                    TombstoneJson.AppendField(sb, "unit", truncate(unit, MAX_METRIC_UNIT), ref first);
+                TombstoneJson.AppendField(sb, "occurredAtIso", nowIso(), ref first);
+                TombstoneJson.AppendField(sb, "buildVersion", _buildVersion, ref first);
+                TombstoneJson.AppendField(sb, "os", _os, ref first);
+                TombstoneJson.AppendField(sb, "arch", _arch, ref first);
+                appendCorrelation(sb, ref first);
+                sb.Append('}');
+                TombstoneBehaviour.AddMetric(sb.ToString());
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"TrackMetric failed: {e.Message}");
+            }
+        }
+
+        /// <summary>Append the Plan 1 correlation spine (role/serverId/matchId/userId/sessionId),
+        /// omitting empty values. Shared by metrics and events so segmentation + cross-actor funnels
+        /// work server-side. Empty strings are never emitted (cleanOptionalId-safe). The role is the
+        /// contract-valid default ("client"/"server"), so it is always present.</summary>
+        private static void appendCorrelation(StringBuilder sb, ref bool first)
+        {
+            if (!string.IsNullOrEmpty(_role)) TombstoneJson.AppendField(sb, "role", _role, ref first);
+            if (!string.IsNullOrEmpty(_serverId)) TombstoneJson.AppendField(sb, "serverId", _serverId, ref first);
+            if (!string.IsNullOrEmpty(_matchId)) TombstoneJson.AppendField(sb, "matchId", _matchId, ref first);
+            if (!string.IsNullOrEmpty(_userId)) TombstoneJson.AppendField(sb, "userId", _userId, ref first);
+            if (!string.IsNullOrEmpty(_sessionId)) TombstoneJson.AppendField(sb, "sessionId", _sessionId, ref first);
         }
 
         /// <summary>
@@ -395,7 +625,14 @@ namespace AnkleBreaker.Tombstone
                 steamId = nullIfEmpty(_steamId),
                 breadcrumbs = snapshotBreadcrumbs(),
                 log = _uploadLogs,
+                role = _role,
+                serverId = _serverId,
+                matchId = _matchId,
+                sessionId = _sessionId,
             };
+            // Pre-crash flush: deliver buffered events/metrics before the (possibly fatal) crash
+            // path may end the process, so a final batch isn't lost when the app dies here.
+            TombstoneBehaviour.FlushBatches();
             TombstoneBehaviour.Enqueue(
                 CRASHES_PATH, JsonUtility.ToJson(payload), UploadDurability.WriteAhead, payload.log);
             // Final flush in the crash path: the on-disk log must include this crash even if
@@ -537,6 +774,13 @@ namespace AnkleBreaker.Tombstone
                 steamId = nullIfEmpty(_steamId),
                 breadcrumbs = null, // this launch's crumbs belong to this session, not the dead one
                 log = _uploadLogs && _hadPreviousLog,
+                // Correlation belongs to the DEAD session: its sessionId rides in the marker; the
+                // match context wasn't persisted, so role stays the contract-valid default ("" would
+                // fail the role enum) and the ids stay empty (cleaned to undefined server-side).
+                role = _role,
+                serverId = _serverId,
+                matchId = _matchId,
+                sessionId = previous.sessionId,
             };
             TombstoneBehaviour.Enqueue(
                 CRASHES_PATH, JsonUtility.ToJson(payload), UploadDurability.WriteAhead,
@@ -646,6 +890,9 @@ namespace AnkleBreaker.Tombstone
         }
 
         private static string nowIso() => DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+
+        /// <summary>Mint a fresh id (GUID "N") — used for the session id and match ids.</summary>
+        private static string newId() => Guid.NewGuid().ToString("N");
 
         /// <summary>Seconds elapsed on the monotonic clock since the dedupe epoch (cached at load).</summary>
         private static double monotonicSeconds() =>

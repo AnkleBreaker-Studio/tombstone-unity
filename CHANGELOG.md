@@ -2,6 +2,84 @@
 
 All notable changes to `com.anklebreaker.tombstone`.
 
+## [0.8.0] - 2026-06-11
+### Added — log-pull control plane (server-triggered session-log retrieval)
+- **`Tombstone.RequestPlayerLogs(PullTarget target, string targetValue, string reason)`** — server-side
+  call (dedicated game server) to queue a pull of a player's / session's / match's / whole-server's
+  session log. Requires a **WRITE-scoped** server token; an ingest-only client token is rejected
+  server-side (403) and surfaced via `[Tombstone]` log, never thrown. Fail-silent; gated on `Init`
+  only (NOT consent — consent is enforced on the client honouring side). Wire body:
+  `{ "targetType", "targetValue", "reason" }` (`targetType` ∈ `userId|sessionId|matchId|server`;
+  `targetValue` clamped to 128, `reason` clamped to 280 to match the server contract).
+- **`Tombstone.RequestPlayerLogs(string target, string reason)`** — convenience overload: `target` is a
+  player userId, or the sentinel `Tombstone.TARGET_ALL_ON_THIS_SERVER` ("all-on-this-server") to pull
+  every player on this dedicated server (resolved to the current serverId).
+- **`Tombstone.OnAnomalousDisconnect(string userId, string reason)`** — convenience auto-pull after a
+  weird disconnect (defaults `reason` to "anomalous disconnect"). Targets the player's userId.
+- **Automatic, transparent client honouring** — the heartbeat 202 ack now carries
+  `data.pendingRequests`. The heartbeat loop parses the ack and, for each request that targets THIS
+  client (by `userId`/`sessionId`/`matchId`/`serverId`) **and only while consent is granted**, POSTs
+  `/api/v1/pull-requests/{requestId}/fulfill` with its asserted identity
+  (`{ userId, sessionId, matchId, serverId }`) and reuses the existing
+  `Enqueue(requestLog:true)` → `scheduleLogUpload` path: the fulfil 2xx's `data.logUpload` presign is
+  chased exactly like a crash/bug, PUTting the rolling session log **off the main thread** (≤512 KB on
+  the ThreadPool). A non-consented or non-targeted client uploads **nothing**.
+- **Perf (§15)**: ack handling adds no per-frame allocation — heartbeats run on an interval, and an ack
+  with an empty `pendingRequests` list short-circuits on a single ordinal substring check **without
+  deserializing** (the empty list carries no `requestId`). All upload work stays off the calling thread;
+  fail-silent throughout; a registry/parse failure degrades to honouring nothing, never affecting gameplay.
+### Added — DTOs
+- `HeartbeatAck` / `HeartbeatAckData` / `PullRequestDto` (parse-only ack) and `PullFulfillPayload`
+  (fulfil POST body). `tests/unity-contract.test.ts` pins the create + fulfil byte shapes against the
+  server's pull-request schemas (additive, backward-compatible — older SDKs ignored the ack body).
+
+## [0.7.0] - 2026-06-11
+### Added — numeric metrics + client-side event/metric batching
+- **`Tombstone.TrackMetric(name, value, unit = null)`** — record a numeric sample (tickrate, RTT,
+  CCU, …). Fail-silent; non-finite values (NaN/Infinity) are dropped, never shipped. Each metric is
+  stamped with the cached correlation spine (`role`/`serverId`/`matchId`/`userId`/`sessionId`) plus
+  `buildVersion`/`os`/`arch` and its own `occurredAtIso`. Hand-built JSON (`TombstoneJson`,
+  AOT-safe): numbers are unquoted + invariant-culture round-trip ("R") formatted; empty ids are
+  omitted. Wire item: `{ name, value, unit?, occurredAtIso, buildVersion, os, arch, role,
+  serverId?, matchId?, userId?, sessionId? }`.
+- **Event + metric batching (§16)** — `TrackEvent` and `TrackMetric` no longer POST once per call.
+  Items accumulate into a **bounded, preallocated, drop-oldest** ring (`TombstoneBatch`, cap 256)
+  and flush as a batch envelope `{ "sentAtIso", "items": [...] }` to
+  `POST /api/v1/ingest/events:batch` / `…/metrics:batch`. Each item keeps its OWN `occurredAtIso`
+  (when it happened); `sentAtIso` is added only at flush time. Flush triggers: **count ≥ 50**,
+  **age ≥ 10s** (low-volume games still report), **near-full**, **`OnApplicationPause`/
+  `OnApplicationQuit`**, and a **pre-crash flush** (before the possibly-fatal write-ahead crash
+  upload). Sends reuse the existing outbound queue, in-session exponential backoff, and
+  `PersistOnFailure` durability — the same class the single-event path used.
+- **Perf budget (§15)**: the batch buffer's backing array is allocated once and never grows; adding
+  an item reuses a ring slot (no per-frame/per-item allocation); the age check is a cheap locked
+  read; an envelope string is built only on the rare flush; all sending stays off the calling
+  thread; the buffer is bounded with drop-oldest; fail-silent throughout.
+### Changed
+- `TrackEvent` now stamps correlation via the shared `appendCorrelation` helper (same keys/omit-empty
+  rules as before) and routes through the event batch buffer instead of a per-event POST.
+- New runtime file `TombstoneBatch.cs` (bounded batch buffer); `TombstoneJson` gains `AppendNumberField`
+  (unquoted, invariant-culture numbers). Wire shapes are additive — `tests/unity-contract.test.ts`
+  pins the batch envelope + metric item; crashes/bug-reports/heartbeats remain **un-batched**
+  (forensic/time-sensitive, sent individually).
+
+## [0.6.0] - 2026-06-11
+### Added — multiplayer correlation: server ↔ session ↔ match ↔ player linking
+- **Match-context API**: three new fail-silent static calls —
+  - `Tombstone.SetMatchContext(serverId, matchId)` tags subsequent telemetry with a dedicated
+    server + match (both clamped to 128 chars; null/"" clears).
+  - `Tombstone.StartMatch()` flips the emitter role to `"server"`, mints + returns a fresh match
+    id (GUID "N") to broadcast to clients.
+  - `Tombstone.EndMatch()` clears the match id (role + server id are kept between matches).
+- **Correlation stamping on every payload**: crashes, bug reports, analytics events, and session
+  heartbeats now carry `role` (`"client"` default / `"server"`), `serverId`, `matchId`, and
+  `sessionId`. Crash/bug/heartbeat stamp via `JsonUtility` (empty ids serialize as `""`, cleaned
+  to `undefined` server-side via `cleanOptionalId`, exactly like `userId`); the hand-built event
+  JSON always emits the enum-valid `role` and omits empty ids. The synthetic unclean-shutdown
+  crash carries the **dead** session's `sessionId` (from the session marker).
+- Wire shape is additive + backward-compatible — `tests/unity-contract.test.ts` pins the
+  `role`/`serverId`/`matchId`/`sessionId` keys against the server's ingest schemas.
+
 ## [0.5.1] - 2026-06-10
 ### Fixed — SDK hardening (audit)
 - **Empty bundleVersion no longer drops all telemetry**: `buildVersion` is now guarded

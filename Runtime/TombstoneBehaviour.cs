@@ -47,11 +47,21 @@ namespace AnkleBreaker.Tombstone
         private const long HTTP_TOO_MANY_REQUESTS = 429;
         private const string QUEUE_DIR_NAME = "Tombstone";
         private const string HEARTBEATS_PATH = "/api/v1/ingest/heartbeats";
+        private const string PULL_REQUESTS_PATH = "/api/v1/pull-requests";
+        // Batch ingest paths (§16). The colon-suffixed wire URL maps to the server's /batch route
+        // folder via a next.config rewrite (a colon is not a legal directory name on Windows).
+        private const string EVENTS_BATCH_PATH = "/api/v1/ingest/events:batch";
+        private const string METRICS_BATCH_PATH = "/api/v1/ingest/metrics:batch";
         private const float LOG_FLUSH_INTERVAL_SECONDS = 5f;
         private const int LOG_UPLOAD_TIMEOUT_SECONDS = 30;
         private const string CONTENT_TYPE_TEXT_PLAIN = "text/plain";
 
         private static readonly ConcurrentQueue<PendingUpload> _outbound = new ConcurrentQueue<PendingUpload>();
+        // Bounded, preallocated event/metric batch buffers (§16/§15): cap 256, flush at 50 items or
+        // 10s age (so low-volume games still report), near-full, pause/quit, and pre-crash. Drop-oldest
+        // beyond cap. Steady-state allocation-free — only a flush (rare) builds an envelope string.
+        private static readonly TombstoneBatch _eventBatch = new TombstoneBatch(256, 50, 10f);
+        private static readonly TombstoneBatch _metricBatch = new TombstoneBatch(256, 50, 10f);
         private static readonly object _persistLock = new object();
         private static TombstoneBehaviour _instance;
         private static string _queueDir;
@@ -139,6 +149,42 @@ namespace AnkleBreaker.Tombstone
             }
         }
 
+        /// <summary>Append a pre-serialized event item to the batch; flush immediately when the
+        /// count/near-full trigger hits. Thread-safe; allocation-free below the flush threshold.</summary>
+        internal static void AddEvent(string itemJson)
+        {
+            if (_eventBatch.Add(itemJson, monotonic())) flushOne(_eventBatch, EVENTS_BATCH_PATH);
+        }
+
+        /// <summary>Append a pre-serialized metric item to the batch; flush immediately when the
+        /// count/near-full trigger hits. Thread-safe; allocation-free below the flush threshold.</summary>
+        internal static void AddMetric(string itemJson)
+        {
+            if (_metricBatch.Add(itemJson, monotonic())) flushOne(_metricBatch, METRICS_BATCH_PATH);
+        }
+
+        /// <summary>Force-drain both buffers (pause/quit/pre-crash). Safe to call from any thread.</summary>
+        internal static void FlushBatches()
+        {
+            flushOne(_eventBatch, EVENTS_BATCH_PATH);
+            flushOne(_metricBatch, METRICS_BATCH_PATH);
+        }
+
+        /// <summary>Drain one buffer into a batch envelope and enqueue it for off-main-thread send via
+        /// the existing upload queue + backoff. PersistOnFailure — the same durability class as the
+        /// single-event path it replaces (retried in-session, persisted only after the final failure).</summary>
+        private static void flushOne(TombstoneBatch batch, string path)
+        {
+            if (!batch.HasItems) return;
+            var envelope = batch.DrainEnvelope(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
+            if (envelope == null) return;
+            enqueueOutbound(PendingUpload.Post(path, envelope, UploadDurability.PersistOnFailure, null, false, false));
+        }
+
+        /// <summary>Monotonic seconds for batch age timing (never runs backward on a clock/NTP jump).</summary>
+        private static double monotonic() =>
+            System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+
         // Unity message — must stay PascalCase (engine-invoked). Allocates nothing when idle:
         // the queue drain no-ops and the log flush is a no-op call when the buffer is empty.
         private void Update()
@@ -147,11 +193,29 @@ namespace AnkleBreaker.Tombstone
             {
                 StartCoroutine(send(item));
             }
+            // Age-trigger flush so low-volume games still report within FlushAgeSeconds. Cheap locked
+            // reads; no allocation when nothing is due.
+            double m = monotonic();
+            if (_eventBatch.ShouldFlushByAge(m)) flushOne(_eventBatch, EVENTS_BATCH_PATH);
+            if (_metricBatch.ShouldFlushByAge(m)) flushOne(_metricBatch, METRICS_BATCH_PATH);
             if (Time.unscaledTime >= _nextLogFlushAt)
             {
                 _nextLogFlushAt = Time.unscaledTime + LOG_FLUSH_INTERVAL_SECONDS;
                 TombstoneSessionLog.RequestFlush();
             }
+        }
+
+        // Unity message — flush buffered analytics when backgrounded (mobile) so a suspended/killed
+        // app still reports. Engine-invoked; must stay PascalCase.
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused) FlushBatches();
+        }
+
+        // Unity message — final flush on quit (complements Tombstone.onQuitting's log flush).
+        private void OnApplicationQuit()
+        {
+            FlushBatches();
         }
 
         private void loadPersistedQueue()
@@ -214,6 +278,9 @@ namespace AnkleBreaker.Tombstone
                     os = TombstonePlatform.Os(),
                     arch = TombstonePlatform.Arch(),
                     userId = Tombstone.CurrentUserId,
+                    role = Tombstone.CurrentRole,
+                    serverId = Tombstone.CurrentServerId,
+                    matchId = Tombstone.CurrentMatchId,
                 };
                 return JsonUtility.ToJson(hb);
             }
@@ -284,6 +351,9 @@ namespace AnkleBreaker.Tombstone
                     deletePersisted(item);
                     if (item.RequestedLog && !item.IsLogPut)
                         scheduleLogUpload(item, req.downloadHandler != null ? req.downloadHandler.text : null);
+                    // Command channel: a heartbeat ack may carry pull requests targeting this client.
+                    if (!item.IsLogPut && item.Path == HEARTBEATS_PATH)
+                        handleHeartbeatAck(req.downloadHandler != null ? req.downloadHandler.text : null);
                     return;
                 }
 
@@ -359,6 +429,72 @@ namespace AnkleBreaker.Tombstone
             catch (Exception e)
             {
                 TombstoneLog.Warn($"log presign handling failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Parse the heartbeat ack and, for each pending pull request that targets THIS client (and
+        /// only while consent is granted), POST a fulfilment that requests a log presign — the
+        /// existing logUpload chase then PUTs the current session log off-thread (§15). Fail-soft
+        /// throughout: a non-targeted or non-consented client uploads nothing. Allocation-light: a
+        /// beat with no pending requests does a single ordinal substring check and returns without
+        /// deserializing (the empty-list ack carries no <c>requestId</c>).
+        /// </summary>
+        private void handleHeartbeatAck(string responseText)
+        {
+            try
+            {
+                // Consent gate FIRST: a non-consented client never uploads its log, even when targeted.
+                if (string.IsNullOrEmpty(responseText) || !Tombstone.CaptureAllowed) return;
+                // Cheap fast-path: skip JsonUtility entirely when there is nothing to honour. An empty
+                // pendingRequests list has no "requestId" key, so most heartbeats short-circuit here.
+                if (responseText.IndexOf("\"requestId\"", StringComparison.Ordinal) < 0) return;
+
+                var ack = JsonUtility.FromJson<HeartbeatAck>(responseText);
+                var pending = ack != null && ack.data != null ? ack.data.pendingRequests : null;
+                if (pending == null || pending.Length == 0) return;
+
+                string userId = Tombstone.CurrentUserId ?? "";
+                string sessionId = _sessionId ?? "";
+                string matchId = Tombstone.CurrentMatchId ?? "";
+                string serverId = Tombstone.CurrentServerId ?? "";
+
+                foreach (var p in pending)
+                {
+                    if (p == null || string.IsNullOrEmpty(p.requestId)) continue;
+                    if (!targetsThisClient(p, userId, sessionId, matchId, serverId)) continue;
+
+                    var payload = new PullFulfillPayload
+                    {
+                        userId = Tombstone.CurrentUserId,                          // null → "" via JsonUtility; server cleans it
+                        sessionId = _sessionId,
+                        matchId = string.IsNullOrEmpty(matchId) ? null : matchId,
+                        serverId = string.IsNullOrEmpty(serverId) ? null : serverId,
+                    };
+                    // requestLog:true → the fulfil 2xx's data.logUpload is chased exactly like a crash/bug,
+                    // reusing scheduleLogUpload (log read ≤512 KB on the ThreadPool, never the main thread).
+                    Enqueue($"{PULL_REQUESTS_PATH}/{p.requestId}/fulfill",
+                        JsonUtility.ToJson(payload), UploadDurability.PersistOnFailure, requestLog: true);
+                }
+            }
+            catch (Exception e)
+            {
+                TombstoneLog.Warn($"heartbeat ack handling failed: {e.Message}");
+            }
+        }
+
+        /// <summary>Mirror of the server's heartbeatMatchesRequest — the client uploads only when it
+        /// is genuinely targeted (and only ever its OWN log). An empty asserted id never matches.</summary>
+        private static bool targetsThisClient(
+            PullRequestDto p, string userId, string sessionId, string matchId, string serverId)
+        {
+            switch (p.targetType)
+            {
+                case "userId": return !string.IsNullOrEmpty(userId) && userId == p.targetValue;
+                case "sessionId": return !string.IsNullOrEmpty(sessionId) && sessionId == p.targetValue;
+                case "matchId": return !string.IsNullOrEmpty(matchId) && matchId == p.targetValue;
+                case "server": return !string.IsNullOrEmpty(serverId) && serverId == p.targetValue;
+                default: return false;
             }
         }
 
